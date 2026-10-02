@@ -457,6 +457,11 @@ def execute_director_plan_core(
     live_tae_preview = raw_live in (True, 1, "1", "true", "True", "on")
 
     all_segments = plan.segments
+    if not is_continue_mode(plan) and any(is_continuity_active(plan, seg) for seg in all_segments):
+        # Report a missing pack before spending time sampling the first segment.
+        from .h3_motion_context import external_motion_context_node
+
+        external_motion_context_node()
     # Drop caches for deleted/shortened timelines. Use every segment index (not
     # run_indices): unselected「选择运行」slots still fill merge/export from disk.
     prune_segment_cache(node_id, [seg.index for seg in all_segments])

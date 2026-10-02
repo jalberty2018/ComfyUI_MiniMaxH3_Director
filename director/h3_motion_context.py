@@ -1,8 +1,8 @@
-"""Director-owned MiniMax H3 segment motion/audio continuation helpers.
+"""MiniMax H3 segment continuation via the external H3 Motion Context node.
 
 Pins the previous segment's tail into the next segment as never-denoised
-conditioning, then trims that prefix from decoded output. Inspired by the
-community Motion Context approach; original Apache-2.0 code for this Director.
+conditioning, then trims that prefix from decoded output. Director adapts its
+segment boundaries; the installed external node builds the H3 conditioning.
 """
 
 from __future__ import annotations
@@ -12,12 +12,24 @@ from typing import Any
 
 import torch
 
-from .h3_context_patches import (
-    CTX_AUDIO_END_KEY,
-    CTX_FRAME_KEY,
-    ensure_layout_patch,
-    ensure_payload_patch,
-)
+# Local metadata only: used by Refine to distinguish pins from endpoint anchors.
+# The external node owns all H3 conditioning and any runtime compatibility work.
+CTX_FRAME_KEY = "director_context_index"
+
+
+def external_motion_context_node():
+    """Resolve lazily, after ComfyUI has registered all custom node packs."""
+    import nodes
+
+    cls = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3MotionContext")
+    if cls is None:
+        raise RuntimeError(
+            "Director continuity requires ComfyUI-H3-Motion-Context. Install or "
+            "enable https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context "
+            "in ComfyUI/custom_nodes and restart ComfyUI."
+        )
+    return cls()
+
 
 log = logging.getLogger("ComfyUI-MiniMaxH3-Director.h3_motion_context")
 
@@ -34,7 +46,7 @@ VIDEO_RUN_GRID = (124, 107, 90, 73, 56, 39, 22, 5, 1)
 CONTINUITY_TASK_KEYS = frozenset({"t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"})
 # v9: pin next first-pass from previous first-pass AV when Refine changed canvas.
 # Single source of truth — imported by segment_cache.segment_cache_fingerprint.
-CONTINUITY_PIPELINE_ID = "minimax_h3_motion_context_v9"
+CONTINUITY_PIPELINE_ID = "minimax_h3_external_motion_context_v10"
 # Example workflow tested value (NikoDemon80): audio_context_length=24 with video=22.
 DEFAULT_AUDIO_CONTEXT_FRAMES = 24
 
@@ -490,197 +502,92 @@ def apply_motion_context(
 
     ``audio_context_length``: official example uses 24 with video context 22.
     """
-    import node_helpers
-
-    ensure_layout_patch()
-    # r2v/v2v/rv2v already carry minimax_refs; stock payload overwrites keyframe
-    # video latents unless coexistence merge is installed.
-    ensure_payload_patch()
+    node = external_motion_context_node()
     context_length = snap_context_frames(context_length)
-    if audio_context_length is None:
+    try:
+        audio_ctx = (DEFAULT_AUDIO_CONTEXT_FRAMES if audio_context_length is None
+                     else max(0, int(audio_context_length)))
+    except (TypeError, ValueError):
         audio_ctx = DEFAULT_AUDIO_CONTEXT_FRAMES
-    else:
-        try:
-            audio_ctx = max(0, int(audio_context_length))
-        except (TypeError, ValueError):
-            audio_ctx = DEFAULT_AUDIO_CONTEXT_FRAMES
 
-    video = video_from_latent(latent)
-    width = int(video.shape[4]) * 16
-    height = int(video.shape[3]) * 16
-    frame_count = pixel_frames_for_latent_t(int(video.shape[2]))
-
-    pin_audio_latent = context_latent
-    if context_latent is not None:
-        src = video_from_latent(context_latent)
-        src_w, src_h = int(src.shape[4]) * 16, int(src.shape[3]) * 16
-        if src_w == width and src_h == height:
-            available = pixel_frames_for_latent_t(int(src.shape[2]))
-            if context_end_frame is not None:
-                available = min(available, max(0, int(context_end_frame)))
-            video_src = "latent"
-        elif context_frames is not None and int(context_frames.shape[0]) >= 1:
-            # Refine upscale stores a larger AV latent; next segment's first pass
-            # is still the Director canvas. Pin from the decoded export instead
-            # of crashing — that export is what concat actually uses.
-            log.warning(
-                "Director continuity: context latent is %dx%d but this segment "
-                "is %dx%d — pin from decoded frames (typical after Refine upscale).",
-                src_w,
-                src_h,
-                width,
-                height,
-            )
-            context_end_frame = None
-            pin_audio_latent = None
-            available = int(context_frames.shape[0])
-            video_src = "pixels"
-        else:
-            raise ValueError(
-                f"Director continuity: context latent is {src_w}x{src_h} but this "
-                f"segment is {width}x{height}. Regenerate the previous segment at "
-                "this resolution, or keep a decoded export for pixel pin."
-            )
-    else:
-        if context_frames is None or int(context_frames.shape[0]) < 1:
-            raise ValueError(
-                "Director continuity: need previous segment latent or decoded frames."
-            )
-        available = int(context_frames.shape[0])
-        video_src = "pixels"
-
-    n = min(int(context_length), available)
-    if n < 1:
-        raise ValueError("Director continuity: no frames available to pin")
-    run = next(g for g in VIDEO_RUN_GRID if g <= n)
-    if run != n:
-        log.warning(
-            "Director continuity: %d frames off VAE grid; pinning last %d.", n, run
-        )
-        n = run
-    if n >= frame_count:
-        raise ValueError(
-            f"Director continuity: cannot pin {n} frames into a {frame_count}-frame clip."
-        )
-
-    pin_end_px: int | None = None
     prev_export_trim_tail = 0
-    if video_src == "latent":
-        blocks, offsets, covered, pin_end_px, prev_export_trim_tail = _video_tail_blocks(
-            context_latent, n, end_frame=context_end_frame
+    if context_latent is not None and av_pixel_size(context_latent) != av_pixel_size(latent):
+        if context_frames is None or int(context_frames.shape[0]) < 1:
+            raise ValueError("Director continuity: canvas mismatch; decoded context frames required.")
+        log.info("Director continuity: using decoded context after a canvas change.")
+        context_latent = None
+        context_end_frame = None
+
+    if context_latent is not None and context_end_frame is not None:
+        # Legacy/cropped exports can end before the sampled latent does. Give
+        # the external node a full AV prefix ending on our aligned pin boundary.
+        video = video_from_latent(context_latent)
+        available = min(pixel_frames_for_latent_t(video.shape[2]), int(context_end_frame))
+        n = min(context_length, available)
+        if n < 1:
+            raise ValueError("Director continuity: no frames available to pin")
+        n = next(g for g in VIDEO_RUN_GRID if g <= n)
+        steps = steps_for_frames(n)
+        start, pin_end, prev_export_trim_tail = _phase_aligned_tail_start(
+            int(video.shape[2]), steps, int(context_end_frame)
         )
-        span = covered
-    else:
-        # Decoded frames are already the export — absolute tail is correct.
-        tail = _resize_frames(context_frames[available - n :], width, height)
-        enc = vae.encode(tail)
-        if getattr(enc, "ndim", 0) != 5:
-            raise ValueError(
-                f"Director continuity: VAE encode returned shape "
-                f"{tuple(getattr(enc, 'shape', ()))}, expected [B,C,T,H,W]."
+        streams = list(_streams_from_latent(context_latent))
+        streams[0] = video[:, :, :start + steps].contiguous()
+        if len(streams) > 1:
+            audio_end = round(pin_end * FRAME_RESCALE)
+            streams[1] = streams[1][..., :audio_end].contiguous()
+        context_latent = dict(context_latent)
+        context_latent["samples"] = _repack_av_streams(streams, context_latent)
+        context_latent.pop("noise_mask", None)
+
+    if context_latent is None and (context_frames is None or int(context_frames.shape[0]) < 1):
+        raise ValueError("Director continuity: need previous segment latent or decoded frames.")
+
+    prepared = []
+    for emb, meta in positive:
+        meta = dict(meta)
+        meta["minimax_keyframes"] = [
+            dict(kf) for kf in (meta.get("minimax_keyframes") or [])
+            if keep_existing_keyframes and CTX_FRAME_KEY not in kf
+        ]
+        prepared.append([emb, meta])
+
+    # The external latent API pins both AV streams. When audio continuation is
+    # disabled, discard only its added audio conditioning after the call, while
+    # retaining the original references (including user-supplied audio).
+    result, trim = getattr(node, node.FUNCTION)(
+        conditioning=prepared, vae=vae, latent=latent,
+        context_length=str(context_length), audio_context_length=audio_ctx,
+        context_latent=context_latent, context_frames=context_frames,
+        context_audio=_usable_context_audio(context_audio) if continue_audio else None,
+        audio_vae=audio_vae,
+    )
+    out = []
+    for (emb, meta), (_, before) in zip(result, prepared):
+        meta = dict(meta)
+        prior = before.get("minimax_keyframes") or []
+        keyframes = []
+        for kf in meta.get("minimax_keyframes") or []:
+            kf = dict(kf)
+            existing = any(
+                kf.get("latent") is old.get("latent")
+                and kf.get("audio_latent") is old.get("audio_latent")
+                and kf.get("resolved_frame_index") == old.get("resolved_frame_index")
+                for old in prior
             )
-        steps = int(enc.shape[2])
-        offsets = step_offsets(steps)
-        covered = pixel_frames_for_latent_t(steps)
-        if covered != n:
-            raise RuntimeError(
-                f"Director continuity: {n} frames encoded to {steps} steps covering "
-                f"{covered}; VAE grid mismatch."
-            )
-        blocks = [enc[:, :, k : k + 1] for k in range(steps)]
-        span = covered
-        pin_end_px = available
-        prev_export_trim_tail = 0
-
-    ctx_keyframes = [
-        {
-            "resolved_frame_index": 0,
-            CTX_FRAME_KEY: int(p),
-            "latent": blk,
-        }
-        for p, blk in zip(offsets, blocks)
-    ]
-
-    merged = list(ctx_keyframes)
-    if keep_existing_keyframes:
-        for kf in _existing_keyframes(positive):
-            # Drop stock first-frame at 0 — replaced by context head.
-            if int(kf.get("resolved_frame_index", -1)) == 0 and CTX_FRAME_KEY not in kf:
-                continue
-            # Avoid duplicating director context markers.
-            if CTX_FRAME_KEY in kf:
-                continue
-            # fl2v keeps the stock last_frame keyframe. Mark it with its own
-            # resolved_frame_index (same pixel-index space as CTX_FRAME_KEY) so
-            # _rewrite_keyframe_times can re-time it when references shift the
-            # target origin, instead of skipping it and tripping the guard.
-            rfi = int(kf.get("resolved_frame_index", -1))
-            if rfi >= 0:
-                kf = dict(kf)
-                kf[CTX_FRAME_KEY] = rfi
-            merged.append(kf)
-
-    values: dict[str, Any] = {
-        "minimax_keyframes": merged,
-        "minimax_frame_count": frame_count,
-    }
-    out = node_helpers.conditioning_set_values(positive, values)
-
-    context_audio = _usable_context_audio(context_audio)
-    if continue_audio and pin_audio_latent is None and context_audio is None:
-        log.warning(
-            "Director continuity: previous export audio is empty; pinning video only."
-        )
-    if continue_audio and (pin_audio_latent is not None or context_audio is not None):
-        # Official: audio window independent; 0 follows video span. Example WF uses 24.
-        a_frames = int(audio_ctx) if audio_ctx > 0 else int(span)
-        # Align audio pin end with the video pin window (not export overshoot).
-        audio_end_limit = pin_end_px if pin_end_px is not None else context_end_frame
-        if pin_audio_latent is not None:
-            audio_latent, ref_audio_t, overhang = _audio_tail_from_latent(
-                pin_audio_latent, a_frames, end_frame=audio_end_limit
-            )
-        else:
-            if audio_vae is None:
-                raise ValueError(
-                    "Director continuity: context_audio requires audio_vae "
-                    "(or pass previous AV latent)."
-                )
-            audio_latent, ref_audio_t = _encode_tail_audio(
-                audio_vae, context_audio, a_frames / float(FPS)
-            )
-            overhang = 0.0
-        end_frame = float(span) + float(overhang) / FRAME_RESCALE
-        end_coord = round(FRAME_RESCALE * end_frame)
-        end_frame = end_coord / FRAME_RESCALE
-        audio_ref = {
-            "kind": "audio",
-            "ref_audio_t": ref_audio_t,
-            "audio_latent": audio_latent,
-            CTX_AUDIO_END_KEY: end_frame,
-        }
-        out = node_helpers.conditioning_set_values(
-            out, {"minimax_refs": [audio_ref]}, append=True
-        )
-        log.info(
-            "Director continuity: pinned %d video frames (%s) + %d audio steps"
-            "%s%s",
-            span,
-            video_src,
-            ref_audio_t,
-            f" (context_end={context_end_frame})" if context_end_frame is not None else "",
-            f", trim_prev_export={prev_export_trim_tail}f" if prev_export_trim_tail else "",
-        )
-    else:
-        log.info(
-            "Director continuity: pinned %d video frames (%s), audio off%s%s",
-            span,
-            video_src,
-            f" (context_end={context_end_frame})" if context_end_frame is not None else "",
-            f", trim_prev_export={prev_export_trim_tail}f" if prev_export_trim_tail else "",
-        )
-
-    return out, int(span), int(prev_export_trim_tail)
+            if not existing:
+                if not continue_audio and "audio_latent" in kf:
+                    continue
+                kf[CTX_FRAME_KEY] = True
+            keyframes.append(kf)
+        meta["minimax_keyframes"] = keyframes
+        if not continue_audio:
+            if "minimax_refs" in before:
+                meta["minimax_refs"] = before["minimax_refs"]
+            else:
+                meta.pop("minimax_refs", None)
+        out.append([emb, meta])
+    return out, int(trim), int(prev_export_trim_tail)
 
 
 def trim_context_prefix(

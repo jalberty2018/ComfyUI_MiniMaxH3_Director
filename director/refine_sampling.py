@@ -420,7 +420,7 @@ def _overwrite_endpoint_keyframes(positive, first_lat, last_lat, last_pixel: int
     """Replace stock first/last keyframe latents; do not touch continuity pins."""
     import copy
 
-    from .h3_context_patches import CTX_FRAME_KEY
+    from .h3_motion_context import CTX_FRAME_KEY
 
     if first_lat is None and last_lat is None:
         return positive

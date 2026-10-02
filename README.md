@@ -1,3 +1,5 @@
+> Segment continuity in guide mode requires the external [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) custom node pack. Install/enable it in `ComfyUI/custom_nodes` and restart ComfyUI. Director calls its registered node directly and no longer installs internal H3 patches. Existing Director workflows need no extra node connections.
+
 # ComfyUI MiniMax H3 Director
 
 基于 **ComfyUI 官方 MiniMax-H3** 的多段音视频导演台插件。仓库地址：[AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)
