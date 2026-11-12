@@ -4385,9 +4385,12 @@ class MiniMaxH3DirectorEditor {
         // re-shows it on top of the green progress title.
         const running = !!this.runStatusEl?.classList.contains("active");
         this.runSelectBar?.classList.toggle("hidden", !enabled || running);
+        this.batchDelSelectedBtn?.classList.toggle("hidden", !enabled);
+        if (this.batchDelSelectedBtn) this.batchDelSelectedBtn.disabled = true;
         if (!canRunSelect) return;
         this.normalizeRunSelection();
         const count = (this.timeline.runSelection || []).length;
+        if (this.batchDelSelectedBtn) this.batchDelSelectedBtn.disabled = running || !count;
         const syncAllCb = (cb) => {
             if (!cb) return;
             cb.checked = count >= n && n > 0;
@@ -10347,6 +10350,39 @@ class MiniMaxH3DirectorEditor {
         }
 
         this.commit(false, { syncTimeline: true });
+    }
+
+    /** 「选择运行」mode batch delete: remove every checked group/segment at once. */
+    deleteCheckedSegments() {
+        if (!this.isRunSelectEnabled?.()) return;
+        if (this.hasExternalI2vGroups?.() || this.hasExternalR2vGroups?.()) return;
+        const n = this.getRunnableSegmentCount();
+        const indices = [...(this.timeline.runSelection || [])]
+            .filter((i) => Number.isInteger(i) && i >= 0 && i < n)
+            .sort((a, b) => a - b);
+        if (!indices.length) { window.alert(t("batch.deleteCheckedNone")); return; }
+        // Full selection is allowed: every mode's single-delete path refuses to
+        // remove the last remaining group/segment, so exactly the first one stays.
+        const prevSel = this.selectedIndex;
+        // Descending so each removal does not shift the still-pending indices.
+        for (let k = indices.length - 1; k >= 0; k--) {
+            const idx = indices[k];
+            if (idx >= this.getRunnableSegmentCount()) continue;
+            this.selectedIndex = idx;
+            this.deleteSelectedSegment();
+        }
+        this.selectedIndex = clamp(prevSel ?? 0, 0, Math.max(0, this.getRunnableSegmentCount() - 1));
+        // Deleted entries were exactly the checked ones: re-arm a full selection
+        // so stale shifted indices never point at the wrong group.
+        if (this.isRunSelectEnabled()) {
+            this.timeline.runSelection = this.isFl2vMode()
+                ? fl2vStartIndices(this)
+                : Array.from({ length: this.getRunnableSegmentCount() }, (_, i) => i);
+        }
+        this.commit(false, { syncTimeline: true });
+        this.updateRunSelectUI();
+        if (this.isImageBatch()) this.renderImageBatchGroups?.();
+        else this.scheduleRender?.();
     }
 
     compactSegmentsAfterDelete() {
